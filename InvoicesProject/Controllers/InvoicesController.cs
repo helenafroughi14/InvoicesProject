@@ -10,8 +10,13 @@ namespace InvoicesProject.Controllers
     {
 
         private readonly IConfiguration _config;
+        private readonly ILogger<InvoicesController> _logger;
         
-        public InvoicesController(IConfiguration config) => _config = config;
+        public InvoicesController(IConfiguration config,ILogger<InvoicesController> logger)  
+        { 
+            _config = config;
+            _logger = logger;
+        }
 
         [HttpPost]
         public async Task<IActionResult> Upload(IFormFile? file)
@@ -31,7 +36,9 @@ namespace InvoicesProject.Controllers
             using var stream = file.OpenReadStream();
             byte[] buffer = new byte[4];
 
-            stream.Read(buffer, 0, buffer.Length);
+            
+            var read = await stream.ReadAsync(buffer, 0, buffer.Length);
+            if (read < 4) return BadRequest("Only PDF are allowed.");
 
             bool isPdf =
                 buffer[0] == 0x25 && // %
@@ -41,15 +48,18 @@ namespace InvoicesProject.Controllers
 
             if (!isPdf)
             {
-                return BadRequest("Only PDFs are allowed.");
+                return BadRequest("Only PDF are allowed.");
             }
 
 
             //upload to blob storage
             var storageConnString = _config["Storage:ConnectionString"];
+            var containerName = _config["Storage:ContainerName"];
             var sqlConnString = _config.GetConnectionString("Sql");
 
-            var container = new BlobContainerClient($"{storageConnString}",$"{sqlConnString}");
+            var container = new BlobContainerClient(storageConnString,containerName);
+            await container.CreateIfNotExistsAsync();
+
             var id = Guid.NewGuid();
 
             var blobName = $"{id}.pdf";
@@ -59,24 +69,42 @@ namespace InvoicesProject.Controllers
             await blob.UploadAsync(stream);
 
             //insert row in sql
-
-            await using var conn = new SqlConnection($"{sqlConnString}");
+            try {            
+            await using var conn = new SqlConnection(sqlConnString);
             await conn.OpenAsync();
 
             await using var cmd = new SqlCommand(
-                "INSERT INTO Invoices (Id,FileName,BlobName,Status,UploadedAt)" +
-                "VALUES (@id, @fn,@bn,'Uploaded',SYSUTCDATETIME())", conn);
+                " INSERT INTO Invoices (Id, FileName, BlobName, Status, UploadedAt )" +
+                " VALUES (@id, @fn, @bn, 'Uploaded', SYSUTCDATETIME()) ", conn);
 
             cmd.Parameters.AddWithValue("@id", id);
             cmd.Parameters.AddWithValue("@fn", file.FileName);
             cmd.Parameters.AddWithValue("@bn", blobName);
 
             await cmd.ExecuteNonQueryAsync();
+            }
 
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SQL insert failed for blob {BlobName}", blobName);
+                
+                try
+                {
+                    await blob.DeleteIfExistsAsync();
+                }
 
+                catch (Exception cleanupEx) 
+                {
+                    _logger.LogError(cleanupEx, "Cleanup failed, orphaned blob {blobName}", blobName);
+                    
+                
+                }
+                
+                return StatusCode(500,"Could not save invoice. Please try again.");
+            }
 
             // return a response
-            return Ok(new { file.FileName, file.Length, file.ContentType });
+            return Created($"/invoices/{id}", new {id, blobName, status = "Uploaded"});
         }
     }
 }
